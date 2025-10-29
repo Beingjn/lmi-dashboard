@@ -1,0 +1,50 @@
+name: daily-greenhouse-snapshot
+
+on:
+  schedule:
+    - cron: "17 3 * * *"   # 03:17 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GCS_BUCKET: lmi-data     
+
+jobs:
+  run-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+
+      # Pass the GitHub token so your script can read raw GitHub URLs without rate limits
+      - name: Export GitHub token for HTTP fetches
+        run: echo "GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> $GITHUB_ENV
+
+      # Authenticate to Google with the JSON key you added as a secret
+      - name: Auth to Google Cloud (JSON key)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Run fetch_greenhouse.py -> GCS
+        run: |
+          # Point to the CSV in your repo (adjust path if yours differs)
+          INPUT_URL="https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/data/companies.csv"
+          OUT_URI="gs://${GCS_BUCKET}/raw/$(date -u +%Y/%m/%d)/greenhouse.jsonl.gz"
+
+          # Adjust script path if your file isn’t under scripts/
+          python scripts/fetch_greenhouse.py \
+            --input-url "$INPUT_URL" \
+            --gcs-uri "$OUT_URI" \
+            --workers 8 \
+            --timeout 30
