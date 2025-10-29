@@ -5,39 +5,6 @@ fetch_greenhouse.py
 
 Fetch job postings from Greenhouse boards listed in a CSV stored in a repository,
 then write the consolidated results to Google Cloud Storage (GCS).
-
-Compared to the older notebook that read/wrote local files, this script:
-- READS: a CSV directly from a repo URL (e.g., GitHub raw) or HTTP(S) endpoint
-- WRITES: gzip-compressed JSON Lines (JSONL.GZ) to GCS, plus a small metadata.json
-
-Usage examples:
-    python fetch_greenhouse.py \
-        --input-url https://raw.githubusercontent.com/your-org/your-repo/main/data/greenhouse_companies.csv \
-        --gcs-uri gs://your-bucket/raw/greenhouse/$(date +%Y%m%d)/greenhouse_$(date +%Y%m%dT%H%M%S).jsonl.gz
-
-    # For private GitHub repos, set GITHUB_TOKEN
-    export GITHUB_TOKEN=ghp_...
-
-    # For GCS auth, set GOOGLE_APPLICATION_CREDENTIALS or ensure ADC is configured
-    export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service_account.json
-
-Input CSV schema (expected columns; extra columns are ignored):
-    board_token, board_url, company_name, domain, jobs_count, status, fetched_at
-At minimum, "board_token" is required. If the other columns are missing, defaults are used.
-
-Output files (written to the same GCS prefix as --gcs-uri):
-    - <gcs-uri> (JSONL.GZ)  : one JSON object per job posting
-    - <gcs-uri>.metadata.json: small metadata about the run (counts, timestamps, source, sha256)
-
-Notes:
-- The Greenhouse Jobs Board API endpoint per company is:
-  https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs?content=true
-- We use limited concurrency + retry to be polite and resilient.
-- We include department and office names, and keep HTML content (no heavy transforms).
-- Any failures per company are logged; the run still completes for others.
-
-Dependencies (install with pip if needed):
-    pip install pandas requests google-cloud-storage urllib3 tqdm
 """
 from __future__ import annotations
 
@@ -58,10 +25,10 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from google.cloud import storage  # type: ignore
+from google.cloud import storage  
 
 GH_API_TEMPLATE = "https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs?content=true"
-DEFAULT_USER_AGENT = "lmi-fetch-greenhouse/1.1 (+https://example.org)"
+DEFAULT_USER_AGENT = "LMI-Dashboard/1.0 (+research; contact=bj.lmi.project@outlook.com)"
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_WORKERS = 8
 DEFAULT_RETRIES = 3
@@ -105,10 +72,6 @@ def _sha256_bytes(b: bytes) -> str:
     return sha256(b).hexdigest()
 
 def read_companies_csv_from_url(url: str, session: Optional[requests.Session] = None, timeout: int = DEFAULT_TIMEOUT) -> pd.DataFrame:
-    """
-    Read the companies CSV from a repo URL or any HTTP(S) URL.
-    Supports private GitHub via GITHUB_TOKEN in the environment.
-    """
     if session is None:
         session = _http_session()
 
@@ -163,38 +126,27 @@ def _infer_is_us_from_text(s: str) -> bool:
     s_lower = f" {s_norm.lower()} "
     s_upper = f" {s_norm.upper()} "
 
-    # Direct US markers
     if re.search(r"\b(united states|u\.?s\.?a?)(?![a-z])", s_lower):
         return True
     if re.search(r"\bremote\b.*\b(us|usa|united states)\b", s_lower):
         return True
-
-    # US ZIP code
     if re.search(r"\b\d{5}(?:-\d{4})?\b", s_norm):
         return True
-
-    # "City, ST" with US state code (avoid Canada if hinted)
     if not any(h in s_lower for h in CANADA_HINTS):
         for m in re.finditer(r",\s*([A-Z]{2})(?:\b|$)", s_upper):
             st = m.group(1)
             if st in US_STATE_ABBR:
-                # Extra caution for "CA": ensure no explicit "Canada"
                 if st == "CA" and " canada" in s_lower:
                     continue
                 return True
-
-    # US state full names
     for name in US_STATE_NAMES:
         if f" {name} " in s_lower:
             return True
-
     return False
 
 def infer_is_us(location_name: str, office_names: List[str]) -> bool:
-    # Check location string
     if _infer_is_us_from_text(location_name):
         return True
-    # Check offices list
     for off in office_names or []:
         if _infer_is_us_from_text(off):
             return True
@@ -288,6 +240,8 @@ def write_metadata_json_to_gcs(json_gcs_uri: str, meta: Dict) -> None:
     upload_bytes_to_gcs(json_gcs_uri, payload, content_type="application/json")
 
 def main(argv: Optional[List[str]] = None) -> int:
+    global DEFAULT_USER_AGENT  
+
     parser = argparse.ArgumentParser(description="Fetch Greenhouse jobs from a repo-listed CSV and upload to GCS.")
     parser.add_argument("--input-url", required=True, help="Repo URL to CSV (e.g., GitHub raw). Must be HTTP(S).")
     parser.add_argument("--gcs-uri", required=True, help="Destination GCS URI for JSONL.GZ (e.g., gs://bucket/path/file.jsonl.gz)")
@@ -299,7 +253,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    global DEFAULT_USER_AGENT
     if args.user_agent:
         DEFAULT_USER_AGENT = args.user_agent
 
@@ -333,7 +286,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     is_us_count = sum(1 for r in records if r.get("is_US"))
     meta = {
-        "source": "greenhouse",
         "input_url": source_url,
         "input_sha256": source_sha256,
         "generated_at": start_ts,
@@ -358,7 +310,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             "is_remote_inferred": "bool",
             "is_US": "bool",
             "fetched_at": "str (ISO8601)",
-            "source": "str (constant 'greenhouse')",
         },
     }
     logging.info("Uploading metadata to: %s", meta_uri)
